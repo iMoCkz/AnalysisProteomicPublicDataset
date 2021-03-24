@@ -6,7 +6,6 @@ from contextlib import closing
 from pyteomics import fasta
 import requests
 from pathlib import Path
-import pandas as pd
 import gzip
 import subprocess
 import os
@@ -26,6 +25,10 @@ class PeptideIdentificationPipeline:
     _fasta_name = 'UP000005640_9606.fasta'
     _fasta_decoy_name = None
     sdrf_files = 0
+    prerequisite_sdrf_cols = ['comment[cleavage agent details]',
+                              'comment[precursor mass tolerance]',
+                              'comment[fragment mass tolerance]',
+                              'comment[number of missed cleavages]']
 
     def __init__(self, accession: str, search_engine: SearchEngineInterface,
                  thermorawfileparser_path: str, search_engine_specific_fdr=False,
@@ -94,61 +97,92 @@ class PeptideIdentificationPipeline:
                     shutil.copyfileobj(r, f)
                 with open(sdrf, 'r') as csv_file:
                     entries = [entry for entry in csv.DictReader(csv_file, delimiter='\t')]
-                    for entry_idx, entry in enumerate(entries):
-                        sdrf_infos = self._read_config_sdrf(entry)
-                        # if needed, create new directory
-                        if self._separate_sdrf_entries:
-                            experiment_name = '/{}'.format(sdrf_infos['name'])
-                            Path(f'{self._accession}{experiment_name}').mkdir(parents=False, exist_ok=True)
-                        else:
-                            experiment_name = ''
-                        # download .raw file
-                        file_name = sdrf_infos['file name']
-                        print('Processing {} ({}/{})'.format(sdrf_infos['name'],
-                                                              entry_idx + 1, len(entries)))
-                        with closing(request.urlopen(sdrf_infos['uri'])) as r:
-                            with open(f'{self._accession}{experiment_name}/{file_name}', 'wb') as f:
-                                shutil.copyfileobj(r, f)
-                        # convert .raw to .mgf using ThermoRawFileParser.exe
-                        arguments = f'{self._thermorawfileparser_path} ' \
-                                    f'-i={self._accession}{experiment_name}/{file_name} ' \
-                                    f'-o={self._accession}{experiment_name} ' \
-                                    f'-f=0'
-                        subprocess.call(arguments, stdout=self._FNULL, stderr=self._FNULL, shell=False)
 
-                        mgf_file = '{}{}/{}'.format(self._accession,
-                                                    experiment_name,
-                                                    file_name.replace('raw', 'mgf'))
-                        self._search_engine.search(database=self._fasta_decoy_name,
-                                                   sdrf_entry=sdrf_infos,
-                                                   mgf_file=mgf_file)
+                    if not all([col in list(entries[0].keys())
+                                for col in self.prerequisite_sdrf_cols]):
+                        print('ERROR: SDRF file does not provide prerequisite information '
+                              '(column names). SDRF file is skipped!')
+                        break
 
-                        if self._use_search_engine_specific_fdr:
-                            self._search_engine.fdr()
-                        else:
-                            self.fdr()
+                col_names = list(entries[0].keys())
+                for entry_idx, entry in enumerate(entries):
+                    sdrf_infos = self._read_config_sdrf(entry, col_names)
+                    # if needed, create new directory
+                    if self._separate_sdrf_entries:
+                        experiment_name = '/{}'.format(sdrf_infos['name'])
+                        Path(f'{self._accession}{experiment_name}').mkdir(parents=False, exist_ok=True)
+                    else:
+                        experiment_name = ''
+                    # download .raw file
+                    file_name = sdrf_infos['file name']
+                    print('Processing {} ({}/{})'.format(sdrf_infos['name'],
+                                                         entry_idx + 1, len(entries)))
+                    with closing(request.urlopen(sdrf_infos['uri'])) as r:
+                        with open(f'{self._accession}{experiment_name}/{file_name}', 'wb') as f:
+                            shutil.copyfileobj(r, f)
+                    # convert .raw to .mgf using ThermoRawFileParser.exe
+                    arguments = f'{self._thermorawfileparser_path} ' \
+                                f'-i={self._accession}{experiment_name}/{file_name} ' \
+                                f'-o={self._accession}{experiment_name} ' \
+                                f'-f=0'
+                    subprocess.call(arguments, stdout=self._FNULL, stderr=self._FNULL, shell=False)
+
+                    mgf_file = '{}{}/{}'.format(self._accession,
+                                                experiment_name,
+                                                file_name.replace('raw', 'mgf'))
+                    self._search_engine.search(database=self._fasta_decoy_name,
+                                               sdrf_entry=sdrf_infos,
+                                               mgf_file=mgf_file)
+
+                    if self._use_search_engine_specific_fdr:
+                        self._search_engine.fdr()
+                    else:
+                        self.fdr()
 
     @staticmethod
-    def _read_config_sdrf(information: OrderedDict) -> dict:
+    def _read_config_sdrf(information: OrderedDict, col_names: list) -> dict:
         return {
-            'experiment name': information['source name'],
-            'organism': information['characteristics[organism]'],
-            'name': information['assay name'],
-            'file name': information['comment[data file]'],
-            'uri': information['comment[file uri]'],
-            'fraction id': information['comment[fraction identifier]'],
-            'label': information['comment[label]'],
-            'instrument': information['comment[instrument]'],
-            'enzyme': re.search('NT=(.*?);', information['comment[cleavage agent details]']).group(1),
-            'precursor mass tolerance': information['comment[precursor mass tolerance]'].replace(' ppm', ''),
-            'fragment mass tolerance': information['comment[fragment mass tolerance]'].replace(' Da', ''),
-            'missed cleavages': information['comment[number of missed cleavages]'],
+            # these four entries are mandatory (because they are necessary for search engine)
+            'enzyme':
+                re.search('NT=(.*?);', information['comment[cleavage agent details]']).group(1),
+            'precursor mass tolerance':
+                information['comment[precursor mass tolerance]'].replace(' ppm', ''),
+            'fragment mass tolerance':
+                information['comment[fragment mass tolerance]'].replace(' Da', ''),
+            'missed cleavages':
+                information['comment[number of missed cleavages]'],
+            # these are additional information
+            'experiment name':
+                information['source name']
+                if 'source name' in col_names else 'Undefined',
+            'organism':
+                information['characteristics[organism]']
+                if 'characteristics[organism]' in col_names else 'Undefined',
+            'name':
+                information['assay name']
+                if 'assay name' in col_names else 'Undefined',
+            'file name':
+                information['comment[data file]']
+                if 'comment[data file]' in col_names else 'Undefined',
+            'uri':
+                information['comment[file uri]']
+                if 'comment[file uri]' in col_names else 'Undefined',
+            'fraction id':
+                information['comment[fraction identifier]']
+                if 'comment[fraction identifier] ' in col_names else 'Undefined',
+            'label':
+                information['comment[label]']
+                if 'comment[label]' in col_names else 'Undefined',
+            'instrument':
+                information['comment[instrument]']
+                if 'comment[instrument]' in col_names else 'Undefined'
         }
 
 
 if __name__ == '__main__':
     comet = Comet('Executables/SearchEngines/comet.exe')
-    pep_ident_pipeline = PeptideIdentificationPipeline(accession='PXD002171',
+    # PXD002171
+    pep_ident_pipeline = PeptideIdentificationPipeline(accession='PXD022725',
                                                        search_engine=comet,
                                                        thermorawfileparser_path=
                                                        'Executables/ThermoRawFileParser/ThermoRawFileParser.exe',
