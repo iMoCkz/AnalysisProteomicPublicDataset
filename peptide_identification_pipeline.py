@@ -16,15 +16,28 @@ from comet import Comet
 
 
 class PeptideIdentificationPipeline:
+    """
+    This class represents the peptide identification pipeline beginning
+    with locating the .sdrf file from PRIDE accession and finishing with
+    determining fdr on search engine output.
+    """
     # option to disable console output from external .exe
+    # is used for thermorawfileparser.exe
     _FNULL = open(os.devnull, 'w')
     # current working directory
     _cwd = Path(__file__).parent.absolute()
+    # Currently this is a hard coded .fasta database, but could differ
+    # in PRIDE investigations / .sdrf files
     _fasta_url = 'https://ftp.uniprot.org/pub/databases/uniprot/current_release/' \
                  'knowledgebase/reference_proteomes/Eukaryota/UP000005640/UP000005640_9606.fasta.gz'
+    # determines name of .fasta file
     _fasta_name = 'UP000005640_9606.fasta'
+    # .fasta database with added decoy gets extension '_decoy'
     _fasta_decoy_name = None
+    # .sdrf file count that is most of the times one
     sdrf_files = 0
+    # .sdrf files necessarily need several information to execute and reproduce
+    # search engine results
     prerequisite_sdrf_cols = ['comment[cleavage agent details]',
                               'comment[precursor mass tolerance]',
                               'comment[fragment mass tolerance]',
@@ -34,23 +47,39 @@ class PeptideIdentificationPipeline:
                  thermorawfileparser_path: str, search_engine_specific_fdr=False,
                  separate_sdrf_entries=False):
         self._accession = accession
+        # possibility to split different 'source name's in separate directories
         self._separate_sdrf_entries = separate_sdrf_entries
+        # used search engine for this pipeline
         self._search_engine = search_engine
         # tested ThermoRawFileParser: v11.3.2 (https://github.com/compomics/ThermoRawFileParser)
         self._thermorawfileparser_path = thermorawfileparser_path
+        # Use FDR calculation given in this pipeline or given by the search engine.
+        # A general approach to calculate the FDR based on .mztab or .mzid would be
+        # recommended, but needs a current implementation on this file types. That
+        # should point to implementations e.g. by pyOpenMS or pyteomics.
         self._use_search_engine_specific_fdr = search_engine_specific_fdr
 
+        # The given search engine must implement methods given by SearchEngineInterface,
+        # which provides the search() method from any search engine.
         assert issubclass(search_engine, SearchEngineInterface), \
             'Search engine does does not implement search engine interface!'
 
-        self._search_engine.separate_sdrf_entries = separate_sdrf_entries
-
     def fdr(self):
-        # TODO: Implement FDR on .mzid oder .mztab (e.g. from pyOpenMS or pyteomics)
+        """
+        Performs False Discovery Rate (FDR) on .mzid or .mztab file
+        given by search engine.
+        """
+        # TODO: Implement FDR on .mzid or .mztab (i.e. from pyOpenMS or pyteomics)
+        # https://pyteomics.readthedocs.io/en/latest/api/mzid.html
+        # did not work for me: mzid.filter()
         pass
 
     def start(self):
-        # check weather ThermoRawFileParser.exe is available
+        """
+        Main methode that starts the pipeline to go from PRIDE accession to
+        FDR calculation on search engine results.
+        """
+        # check whether ThermoRawFileParser.exe is available
         assert Path(self._thermorawfileparser_path).is_file(), \
             'Executable to ThermoRawFileParser not found.'
 
@@ -58,6 +87,7 @@ class PeptideIdentificationPipeline:
         req = requests.get(f'https://www.ebi.ac.uk/pride/ws/archive/v2/files/byProject?accession={self._accession}',
                            headers={'Accept': 'application/json'})
 
+        # check whether API request contains success notification
         assert req.status_code == 200, \
             f'Unsuccessful PRIDE access via accession (HTTP response status code {req.status_code}).'
 
@@ -126,14 +156,15 @@ class PeptideIdentificationPipeline:
                                 f'-o={self._accession}{experiment_name} ' \
                                 f'-f=0'
                     subprocess.call(arguments, stdout=self._FNULL, stderr=self._FNULL, shell=False)
-
+                    # determine path to created .mgf file
                     mgf_file = '{}{}/{}'.format(self._accession,
                                                 experiment_name,
                                                 file_name.replace('raw', 'mgf'))
+                    # start search engine search
                     self._search_engine.search(database=self._fasta_decoy_name,
                                                sdrf_entry=sdrf_infos,
                                                mgf_file=mgf_file)
-
+                    # perform FDR on results
                     if self._use_search_engine_specific_fdr:
                         self._search_engine.fdr()
                     else:
@@ -141,6 +172,12 @@ class PeptideIdentificationPipeline:
 
     @staticmethod
     def _read_config_sdrf(information: OrderedDict, col_names: list) -> dict:
+        """
+        Reads and attracts configuration from .sdrf entry.
+        :param information: Information from .sdrf entry.
+        :param col_names: Actual column names from given .sdrf file.
+        :return: Processed configuration from .sdrf entry.
+        """
         return {
             # these four entries are mandatory (because they are necessary for search engine)
             'enzyme':
@@ -181,8 +218,7 @@ class PeptideIdentificationPipeline:
 
 if __name__ == '__main__':
     comet = Comet('Executables/SearchEngines/comet.exe')
-    # PXD002171
-    pep_ident_pipeline = PeptideIdentificationPipeline(accession='PXD022725',
+    pep_ident_pipeline = PeptideIdentificationPipeline(accession='PXD002171',
                                                        search_engine=comet,
                                                        thermorawfileparser_path=
                                                        'Executables/ThermoRawFileParser/ThermoRawFileParser.exe',

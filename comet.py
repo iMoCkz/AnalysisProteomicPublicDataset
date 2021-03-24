@@ -7,8 +7,8 @@ import numpy as np
 
 
 class Comet(SearchEngineInterface):
+    # current working directory
     _cwd = None
-    _separate_sdrf_entries = False
     # option to disable console output from external .exe
     _FNULL = open(os.devnull, 'w')
     _param_file = None
@@ -28,21 +28,21 @@ class Comet(SearchEngineInterface):
     def cwd(self, value):
         self._cwd = value
 
-    @property
-    def separate_sdrf_entries(self):
-        return self._separate_sdrf_entries
-
-    @separate_sdrf_entries.setter
-    def separate_sdrf_entries(self, value):
-        self._separate_sdrf_entries = value
-
     @staticmethod
     def _adjust_param_file(params: list, search_params: dict) -> list:
+        """
+        Takes a newly created comet.params (to be more accurate: comet.params.new)
+        file as list (one row == one entry) and adjusts the parameter file
+        according to the given .sdrf entry.
+        :param params: List of rows from parameter file
+        :param search_params: Parameters to be adjusted in the original parameter file.
+        :return: List of adjusted parameters (removed comments behind '#')
+        """
         params_left_to_change = len(search_params)
         for idx in range(len(params)):
             for key in search_params.keys():
                 if key in params[idx]:
-                    params[idx] = '{} = {}\n'.format(key, search_params[key])
+                    params[idx] = f'{key} = {search_params[key]}\n'
                     params_left_to_change -= 1
                     if params_left_to_change == 0:
                         break
@@ -51,6 +51,11 @@ class Comet(SearchEngineInterface):
 
     @staticmethod
     def _enzym_number(enzyme: str) -> str:
+        """
+        Matches cleavage enzyme to number in comet.exe (see bottom of comet.params)
+        :param enzyme: cleavage enzyme
+        :return: number of cleavage enzyme for comet.params
+        """
         return {
             'Trypsin': '1',
             'Trypsin/P': '2',
@@ -65,23 +70,35 @@ class Comet(SearchEngineInterface):
         }[enzyme]
 
     def _create_comet_param_file(self):
-        # create comet parameter file and move/rename it (see README.txt from comet)
-        # this parameter file will be created once and edited for every experiment
+        """
+        Creates comet parameter file that is mandatory to execute search on comet.
+        """
+        # create comet parameter file (see README.txt from comet)
         arguments = f'{self._path_to_executable} -p'
         subprocess.call(arguments, stdout=self._FNULL, stderr=self._FNULL, shell=False)
 
+        # comet.params.new is created in directory of PeptideIdentificationPipeline, so
+        # the parameter file will be renamed 'comet.params' as expected by comet.exe
         self._param_file = f'{self._cwd}/comet.params'
         if Path(self._param_file).is_file():
             os.remove(self._param_file)
         os.rename(f'{self._cwd}/comet.params.new', self._param_file)
 
     def search(self, database: str, sdrf_entry: dict, mgf_file: str):
+        """
+        Start comet search with specific .fasta database, .sdrf entry and .mgf file.
+        :param database: .fasta database suitable for given PRIDE accession.
+        :param sdrf_entry: Entry from .sdrf file with meta information.
+        :param mgf_file: .mgf file that contains data to be investigated.
+        """
         self._mgf_file = mgf_file
         self._create_comet_param_file()
 
+        # read comet.params
         with open(self._param_file, 'r') as f:
             content = f.readlines()
 
+        # determine adjusted parameter and rewrite to content
         params = self._adjust_param_file(content,
                                          {'database_name': f'{self._cwd}/{database}',
                                           'peptide_mass_tolerance': sdrf_entry['precursor mass tolerance'],
@@ -92,37 +109,49 @@ class Comet(SearchEngineInterface):
                                           'output_pepxmlfile': '0',
                                           'output_mzidentmlfile': '1'})
 
+        # overwrite parameter file
         with open(self._param_file, 'w') as f:
             f.writelines(params)
 
-        # e.g. comet.exe C:/Users/Max/PycharmProjects/ComputationalProteomics/PXD002171/OEI06439.mgf
         # e.g. comet.exe C:/Users/../ComputationalProteomics/PXD002171/OEI06439.mgf
         arguments = f'{self._cwd}/{self._path_to_executable} {self._mgf_file}'
         subprocess.call(arguments, shell=False)
 
     def _fdr_on_txt_output(self):
+        """
+        Perform FDR on .txt output from comet.exe (must be set in parameter file)
+        """
         output_file = self._mgf_file.replace('.mgf', '')
 
-        data = pd.read_csv(f'{output_file}.txt', delimiter='\t', skiprows=[0])
-        # see 'A deeper look into Comet – implementation and features'
-        data.sort_values(['e-value'], inplace=True)
-        #
-        data.reset_index(inplace=True)
-        # add column that indicates whether protein is decoy or not
-        data['is_decoy'] = np.where(data['protein'].str.contains('DECOY'), 1, 0)
+        if Path(f'{output_file}.txt').is_file():
+            data = pd.read_csv(f'{output_file}.txt', delimiter='\t', skiprows=[0])
+            # see 'A deeper look into Comet – implementation and features'
+            data.sort_values(['e-value'], inplace=True)
+            data.reset_index(inplace=True)
+            # add column that indicates whether protein is decoy or not
+            data['is_decoy'] = np.where(data['protein'].str.contains('DECOY'), 1, 0)
 
-        is_decoy = data['is_decoy'].to_numpy()
-        decoy_count = np.zeros(len(is_decoy))
+            # perform row-wise calculation on numpy array (for best performance)
+            is_decoy = data['is_decoy'].to_numpy()
+            decoy_count = np.zeros(len(is_decoy))
 
-        for entry_idx in range(1, len(data)):
-            decoy_count[entry_idx] = decoy_count[entry_idx - 1] + is_decoy[entry_idx]
+            # cumulate decoys for each PSM
+            for entry_idx in range(1, len(data)):
+                decoy_count[entry_idx] = decoy_count[entry_idx - 1] + is_decoy[entry_idx]
 
-        data['decoy_count'] = decoy_count
-        data['fdr'] = data['decoy_count'] / (data.index + 1 - data['decoy_count'])
+            data['decoy_count'] = decoy_count
+            # calculate FDR
+            data['fdr'] = data['decoy_count'] / (data.index + 1 - data['decoy_count'])
 
-        data.to_csv(f'{output_file}_fdr.csv', sep=';')
+            # write dataframe after adding colums and calculating FDR to a new file
+            data.to_csv(f'{output_file}_fdr.csv', sep=';')
+        else:
+            print(f'{output_file} not found. FDR is skipped.')
 
     def fdr(self):
-        # another option that did not work for:
-        # https://pyteomics.readthedocs.io/en/latest/api/mzid.html
+        """
+        Perform search engine specific FDR
+        :return:
+        """
+        # an search engine specific fdr option performed on the outputted .txt
         self._fdr_on_txt_output()
