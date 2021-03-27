@@ -145,6 +145,9 @@ class Comet(SearchEngineInterface):
 
             # write dataframe after adding colums and calculating FDR to a new file
             data.to_csv(f'{output_file}_fdr.csv', sep=';')
+            # write cleaned up data (remove decoys and PSM with FDR > 0.01)
+            data = data[(~data['protein'].str.contains('DECOY')) & (data['fdr'] <= 0.01)]
+            data.to_csv(f'{output_file}_fdr_cleaned.csv', sep=';')
         else:
             print(f'{output_file} not found. FDR is skipped.')
 
