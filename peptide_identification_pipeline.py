@@ -4,6 +4,7 @@ import urllib.request as request
 from collections import OrderedDict
 from contextlib import closing
 from pyteomics import fasta
+import pandas as pd
 import requests
 from pathlib import Path
 import gzip
@@ -24,16 +25,16 @@ class PeptideIdentificationPipeline:
     # option to disable console output from external .exe
     # is used for thermorawfileparser.exe
     _FNULL = open(os.devnull, 'w')
+    # path to .fasta overview file (README) from uniprot
+    UNIPROT_FASTA_BASIS_PATH = \
+        'https://ftp.uniprot.org/pub/databases/uniprot/' \
+        'current_release/knowledgebase/reference_proteomes'
+    # path to .fasta map file
+    FASTA_MAP_FILE = 'fasta_map.csv'
+    # using same .fasta database for every sample in .sdrf file
+    use_same_fasta = False
     # current working directory
     _cwd = Path(__file__).parent.absolute()
-    # Currently this is a hard coded .fasta database, but could differ
-    # in PRIDE investigations / .sdrf files
-    _fasta_url = 'https://ftp.uniprot.org/pub/databases/uniprot/current_release/' \
-                 'knowledgebase/reference_proteomes/Eukaryota/UP000005640/UP000005640_9606.fasta.gz'
-    # determines name of .fasta file
-    _fasta_name = 'UP000005640_9606.fasta'
-    # .fasta database with added decoy gets extension '_decoy'
-    _fasta_decoy_name = None
     # .sdrf file count that is most of the times one
     sdrf_files = 0
     # .sdrf files necessarily need several information to execute and reproduce
@@ -41,7 +42,9 @@ class PeptideIdentificationPipeline:
     prerequisite_sdrf_cols = ['comment[cleavage agent details]',
                               'comment[precursor mass tolerance]',
                               'comment[fragment mass tolerance]',
-                              'comment[number of missed cleavages]']
+                              'comment[number of missed cleavages]',
+                              'characteristics[organism]']
+    fasta_map = None
 
     def __init__(self, accession: str, search_engine: SearchEngineInterface,
                  thermorawfileparser_path: str, search_engine_specific_fdr=False,
@@ -58,7 +61,6 @@ class PeptideIdentificationPipeline:
         # recommended, but needs a current implementation on this file types. That
         # should point to implementations e.g. by pyOpenMS or pyteomics.
         self._use_search_engine_specific_fdr = search_engine_specific_fdr
-
         # The given search engine must implement methods given by SearchEngineInterface,
         # which provides the search() method from any search engine.
         assert issubclass(search_engine, SearchEngineInterface), \
@@ -73,6 +75,94 @@ class PeptideIdentificationPipeline:
         # https://pyteomics.readthedocs.io/en/latest/api/mzid.html
         # did not work for me: mzid.filter()
         pass
+
+    def create_fasta_map(self, readme_url: str):
+        """
+
+        :param readme_url:
+        """
+        # create directory for databases
+        Path('databases').mkdir(parents=False, exist_ok=True)
+
+        with closing(request.urlopen(readme_url)) as r:
+            with open('fasta_cache.txt', 'wb') as f:
+                shutil.copyfileobj(r, f)
+
+        with open('fasta_cache.txt', 'r') as f:
+            content = f.readlines()
+
+        os.remove('fasta_cache.txt')
+
+        start_idx = -1
+        for idx, line in enumerate(content):
+            if 'Proteome_ID\t' in line:
+                start_idx = idx
+                break
+
+        end_idx = -1
+        for idx in range(start_idx + 1, len(content)):
+            if content[idx] == '\n':
+                end_idx = idx
+                break
+
+        data = pd.DataFrame(columns=[col.replace('\n', '')
+                                     for col in content[start_idx].split('\t')],
+                            data=[line.replace('\n', '').split('\t')
+                                  for line in content[start_idx + 1:end_idx]])
+
+        data.to_csv('databases/fasta_map.csv', sep=';', index=False)
+
+    def _receive_fasta_database(self, organism: str) -> str:
+        # find organism in .fasta map while ignoring case
+        relevant_fasta_databases = \
+            self.fasta_map[self.fasta_map['Species Name'].str.contains(f'(?i){organism}')]
+        relevant_fasta_databases.reset_index(inplace=True)
+
+        if len(relevant_fasta_databases) > 0:
+            while True:
+                print('\nChoose your FASTA database by given index:')
+                for idx, entry in relevant_fasta_databases.iterrows():
+                    print('\t({})\t oscode: {}\tsuperregnum: {}\tspecies: {}'.format(
+                        idx + 1, entry['OSCODE'], entry['SUPERREGNUM'], entry['Species Name']))
+
+                selection = input('Selection: ')
+                if selection.isnumeric() and 0 < int(selection) <= len(relevant_fasta_databases):
+                    selection = int(selection) - 1
+                    break
+                else:
+                    print('Please only choose a valid index!')
+
+            fasta_db_info = relevant_fasta_databases.iloc[selection]
+            fasta_name = 'databases/{}'.format(fasta_db_info['Proteome_ID'])
+            fasta_url  = '{}/{}/{}/{}_{}.fasta.gz'.format(
+                self.UNIPROT_FASTA_BASIS_PATH, fasta_db_info['SUPERREGNUM'].capitalize(),
+                fasta_db_info['Proteome_ID'], fasta_db_info['Proteome_ID'],
+                fasta_db_info['Tax_ID'])
+
+            if not Path(f'{fasta_name}_decoy.fasta').is_file():
+                if not Path(f'{fasta_name}.fasta').is_file():
+                    with request.urlopen(fasta_url) as response, \
+                            open(f'{fasta_name}.fasta', 'wb') as out_file:
+                        with gzip.GzipFile(fileobj=response) as uncompressed:
+                            shutil.copyfileobj(uncompressed, out_file)
+                # remove old decoy database (otherwise it appends data)
+                # and add decoys to database
+                if Path(f'{fasta_name}_decoy.fasta').is_file():
+                    os.remove(f'{fasta_name}_decoy.fasta')
+                fasta.write_decoy_db(source=f'{fasta_name}.fasta',
+                                     output=f'{fasta_name}_decoy.fasta')
+
+            while True:
+                answer = \
+                    input('Do you want to keep this FASTA database for every sample (y/n)? ')
+                if answer in ['y', 'n']:
+                    if answer == 'y':
+                        self.use_same_fasta = True
+                    break
+
+            return f'{fasta_name}_decoy.fasta'
+        else:
+            return None
 
     def start(self):
         """
@@ -103,19 +193,10 @@ class PeptideIdentificationPipeline:
 
         # create directory for acession
         Path(self._accession).mkdir(parents=False, exist_ok=True)
-
-        # download database (.fasta) for search engine
-        if not Path(self._fasta_name).is_file():
-            with request.urlopen(self._fasta_url) as response, open(self._fasta_name, 'wb') as out_file:
-                with gzip.GzipFile(fileobj=response) as uncompressed:
-                    shutil.copyfileobj(uncompressed, out_file)
-
-        # add decoys to database
-        self._fasta_decoy_name = self._fasta_name.replace('.fasta', '_decoy.fasta')
-        fasta.write_decoy_db(source=self._fasta_name, output=self._fasta_decoy_name)
-
-        # set current working directory for search engine
-        self._search_engine.cwd = self._cwd
+        # load .fasta map to acquire according .fasta darabase(s)
+        if not Path(f'databases/{self.FASTA_MAP_FILE}').is_file():
+            self.create_fasta_map(f'{self.UNIPROT_FASTA_BASIS_PATH}/README')
+        self.fasta_map = pd.read_csv(f'databases/{self.FASTA_MAP_FILE}', sep=';')
 
         # download and iterate every .sdrf file found for appropriate accession
         for idx, file in enumerate(files):
@@ -137,38 +218,45 @@ class PeptideIdentificationPipeline:
                 col_names = list(entries[0].keys())
                 for entry_idx, entry in enumerate(entries):
                     sdrf_infos = self._read_config_sdrf(entry, col_names)
-                    # if needed, create new directory
-                    if self._separate_sdrf_entries:
-                        experiment_name = '/{}'.format(sdrf_infos['name'])
-                        Path(f'{self._accession}{experiment_name}').mkdir(parents=False, exist_ok=True)
+                    #
+                    if not self.use_same_fasta or entry_idx == 0:
+                        fasta_db = self._receive_fasta_database(sdrf_infos['organism'])
+                    if fasta_db:
+                        # if needed, create new directory
+                        if self._separate_sdrf_entries:
+                            sample_name = '/{}'.format(sdrf_infos['name'])
+                            Path(f'{self._accession}{sample_name}').mkdir(parents=False, exist_ok=True)
+                        else:
+                            sample_name = ''
+                        file_name = sdrf_infos['file name']
+                        print('\nProcessing {} ({}/{})'.format(sdrf_infos['name'],
+                                                             entry_idx + 1, len(entries)))
+                        # download .raw file
+                        with closing(request.urlopen(sdrf_infos['uri'])) as r:
+                            with open(f'{self._accession}{sample_name}/{file_name}', 'wb') as f:
+                                shutil.copyfileobj(r, f)
+                        # convert .raw to .mgf using ThermoRawFileParser.exe
+                        arguments = f'{self._thermorawfileparser_path} ' \
+                                    f'-i={self._accession}{sample_name}/{file_name} ' \
+                                    f'-o={self._accession}{sample_name} ' \
+                                    f'-f=0'
+                        subprocess.call(arguments, stdout=self._FNULL, stderr=self._FNULL, shell=False)
+                        # determine path to created .mgf file
+                        mgf_file = '{}{}/{}'.format(self._accession,
+                                                    sample_name,
+                                                    file_name.replace('raw', 'mgf'))
+                        # start search engine search
+                        self._search_engine.search(cwd=self._cwd,
+                                                   database=fasta_db,
+                                                   sdrf_entry=sdrf_infos,
+                                                   mgf_file=mgf_file)
+                        # perform FDR on results
+                        if self._use_search_engine_specific_fdr:
+                            self._search_engine.fdr()
+                        else:
+                            self.fdr()
                     else:
-                        experiment_name = ''
-                    # download .raw file
-                    file_name = sdrf_infos['file name']
-                    print('Processing {} ({}/{})'.format(sdrf_infos['name'],
-                                                         entry_idx + 1, len(entries)))
-                    with closing(request.urlopen(sdrf_infos['uri'])) as r:
-                        with open(f'{self._accession}{experiment_name}/{file_name}', 'wb') as f:
-                            shutil.copyfileobj(r, f)
-                    # convert .raw to .mgf using ThermoRawFileParser.exe
-                    arguments = f'{self._thermorawfileparser_path} ' \
-                                f'-i={self._accession}{experiment_name}/{file_name} ' \
-                                f'-o={self._accession}{experiment_name} ' \
-                                f'-f=0'
-                    subprocess.call(arguments, stdout=self._FNULL, stderr=self._FNULL, shell=False)
-                    # determine path to created .mgf file
-                    mgf_file = '{}{}/{}'.format(self._accession,
-                                                experiment_name,
-                                                file_name.replace('raw', 'mgf'))
-                    # start search engine search
-                    self._search_engine.search(database=self._fasta_decoy_name,
-                                               sdrf_entry=sdrf_infos,
-                                               mgf_file=mgf_file)
-                    # perform FDR on results
-                    if self._use_search_engine_specific_fdr:
-                        self._search_engine.fdr()
-                    else:
-                        self.fdr()
+                        print('There is no associated FASTA database.')
 
     @staticmethod
     def _read_config_sdrf(information: OrderedDict, col_names: list) -> dict:
@@ -188,13 +276,12 @@ class PeptideIdentificationPipeline:
                 information['comment[fragment mass tolerance]'].replace(' Da', ''),
             'missed cleavages':
                 information['comment[number of missed cleavages]'],
+            'organism':
+                information['characteristics[organism]'],
             # these are additional information
             'experiment name':
                 information['source name']
                 if 'source name' in col_names else 'Undefined',
-            'organism':
-                information['characteristics[organism]']
-                if 'characteristics[organism]' in col_names else 'Undefined',
             'name':
                 information['assay name']
                 if 'assay name' in col_names else 'Undefined',
@@ -217,11 +304,11 @@ class PeptideIdentificationPipeline:
 
 
 if __name__ == '__main__':
-    comet = Comet('Executables/SearchEngines/comet.exe')
+    comet = Comet('executables/search_engines/comet.exe')
     pep_ident_pipeline = PeptideIdentificationPipeline(accession='PXD002171',
                                                        search_engine=comet,
                                                        thermorawfileparser_path=
-                                                       'Executables/ThermoRawFileParser/ThermoRawFileParser.exe',
+                                                       'executables/ThermoRawFileParser/ThermoRawFileParser.exe',
                                                        search_engine_specific_fdr=True,
                                                        separate_sdrf_entries=True)
     pep_ident_pipeline.start()
