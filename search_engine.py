@@ -6,7 +6,9 @@ class SearchEngineMeta(type):
 
     def __subclasscheck__(cls, subclass):
         return hasattr(subclass, 'search') and \
-               callable(subclass.search)
+               callable(subclass.search) and \
+               hasattr(subclass, 'fdr') and \
+               callable(subclass.fdr)
 
 
 class SearchEngineInterface(metaclass=SearchEngineMeta):
