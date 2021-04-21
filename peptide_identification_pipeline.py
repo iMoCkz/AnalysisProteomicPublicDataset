@@ -122,8 +122,8 @@ class PeptideIdentificationPipeline:
             while True:
                 print('\nChoose your FASTA database by given index:')
                 for idx, entry in relevant_fasta_databases.iterrows():
-                    print('\t({})\t oscode: {}\tsuperregnum: {}\tspecies: {}'.format(
-                        idx + 1, entry['OSCODE'], entry['SUPERREGNUM'], entry['Species Name']))
+                    print('\t({})\t Proteome ID: {}\t Taxonomy ID: {}\tsuperregnum: {}\tspecies name: {}'.format(
+                        idx + 1, entry['Proteome_ID'], entry['Tax_ID'], entry['SUPERREGNUM'], entry['Species Name']))
 
                 selection = input('Selection: ')
                 if selection.isnumeric() and 0 < int(selection) <= len(relevant_fasta_databases):
@@ -200,7 +200,7 @@ class PeptideIdentificationPipeline:
 
         # download and iterate every .sdrf file found for appropriate accession
         for idx, file in enumerate(files):
-            print(f'Processing .sdrf file ({idx + 1}/{len(files)})')
+            print(f'Processing .sdrf file ({idx + 1}/{len(files)}) from {self._accession}')
             with closing(request.urlopen(file)) as r:
                 # download .sdrf
                 sdrf = '{}/{}'.format(self._accession, file.split('/')[-1])
